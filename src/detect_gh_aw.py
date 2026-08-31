@@ -313,6 +313,14 @@ def resolve_repository_source(df: pd.DataFrame) -> RepositorySource:
                 )
             )
 
+    # A complete single-column match is already unambiguous enough for large
+    # exports.  Avoid scanning every possible owner/repository pair in that
+    # case; those pair scans are useful only when no single field is reliable.
+    if candidates and max(candidate.coverage for candidate in candidates) >= 0.999999:
+        candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+        if len(candidates) == 1 or abs(candidates[0].score - candidates[1].score) >= 1e-9:
+            return candidates[0]
+
     owner_columns = [str(column) for column in df.columns if _is_owner_candidate(str(column))]
     repository_columns = [
         str(column) for column in df.columns if _is_repository_candidate(str(column))

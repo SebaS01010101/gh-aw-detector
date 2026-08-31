@@ -185,22 +185,35 @@ def run(args: argparse.Namespace) -> int:
         else output_path.with_suffix(output_path.suffix + ".gz")
     )
 
-    if output_path.exists() and not args.force:
+    if output_path.exists() and not (args.force or args.overwrite_output):
         raise RuntimeError(
-            f"Ya existe {output_path}. Usa --force solo si deseas reemplazarlo."
+            f"Ya existe {output_path}. Usa --overwrite-output o --force si deseas reemplazarlo."
         )
 
     search_url, download_url = build_urls(args.committed_min)
     print("Consultando el total de resultados de SEART...")
     probe = _curl_json(search_url)
-    total_items = probe.get("totalItems")
-    total_pages = probe.get("totalPages")
-    if not isinstance(total_items, int) or not isinstance(total_pages, int):
+    observed_total_items = probe.get("totalItems")
+    observed_total_pages = probe.get("totalPages")
+    if not isinstance(observed_total_items, int) or not isinstance(observed_total_pages, int):
         raise RuntimeError(
             "La respuesta de SEART no contiene totalItems/totalPages; "
             "no se descargará un resultado incompleto."
         )
-    print(f"SEART informa {total_items:,} repositorios ({total_pages:,} páginas).")
+    expected_total_items = (
+        args.expected_total if args.expected_total is not None else observed_total_items
+    )
+    if args.expected_total is not None and args.expected_total != observed_total_items:
+        print(
+            "Advertencia: SEART cambió mientras se preparaba la exportación; "
+            f"se validará contra el total registrado al inicio ({args.expected_total:,}), "
+            f"no contra el total actual ({observed_total_items:,})."
+        )
+    print(
+        f"SEART informa ahora {observed_total_items:,} repositorios "
+        f"({observed_total_pages:,} páginas); se espera una exportación de "
+        f"{expected_total_items:,} filas."
+    )
 
     if archive_path.exists() and not args.force:
         print(f"Reutilizando exportación gzip existente: {archive_path.resolve()}")
@@ -211,9 +224,13 @@ def run(args: argparse.Namespace) -> int:
     print("Descomprimiendo la exportación en el CSV de entrada...")
     decompress_archive(archive_path, output_path)
     rows, columns, delimiter, encoding = inspect_csv(output_path)
-    if rows != total_items:
+    post_probe = _curl_json(search_url)
+    post_total_items = post_probe.get("totalItems")
+    post_total_pages = post_probe.get("totalPages")
+    if rows != expected_total_items:
         raise RuntimeError(
-            f"El CSV contiene {rows:,} filas, pero SEART informó {total_items:,}; "
+            f"El CSV contiene {rows:,} filas, pero el total esperado al inicio era "
+            f"{expected_total_items:,}; "
             "se conserva el archivo para inspección, pero no se considera válido."
         )
 
@@ -225,8 +242,16 @@ def run(args: argparse.Namespace) -> int:
         "download_format": "csv.gz (decompressed to CSV)",
         "filters": {"committedMin": args.committed_min},
         "extracted_at_utc": utc_now(),
-        "probe_total_items": total_items,
-        "probe_total_pages": total_pages,
+        "probe_total_items": expected_total_items,
+        "probe_total_pages": (
+            args.expected_total if args.expected_total is not None else observed_total_pages
+        ),
+        "probe_total_items_observed_before_download_or_reuse": observed_total_items,
+        "probe_total_pages_observed_before_download_or_reuse": observed_total_pages,
+        "probe_total_items_after_download": post_total_items,
+        "probe_total_pages_after_download": post_total_pages,
+        "source_changed_during_extraction": post_total_items != expected_total_items,
+        "rows_match_expected_start_total": rows == expected_total_items,
         "input_path": str(output_path.resolve()),
         "input_rows": rows,
         "input_columns": columns,
@@ -237,6 +262,11 @@ def run(args: argparse.Namespace) -> int:
         "archive_sha256": sha256_file(archive_path),
         "probe_first_item": (
             probe.get("items", [{}])[0] if probe.get("items") else None
+        ),
+        "probe_first_item_after_download": (
+            post_probe.get("items", [{}])[0]
+            if post_probe.get("items")
+            else None
         ),
     }
     write_metadata(metadata_path, metadata)
@@ -264,6 +294,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--archive",
         help="Ruta de una exportación .csv.gz existente o a descargar.",
+    )
+    parser.add_argument(
+        "--expected-total",
+        type=int,
+        help="Total registrado al inicio de una descarga ya existente.",
+    )
+    parser.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        help="Recrear el CSV usando el archive existente sin volver a descargarlo.",
     )
     parser.add_argument(
         "--force",
