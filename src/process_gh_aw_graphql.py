@@ -9,6 +9,7 @@ without querying completed repositories again.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import asdict
@@ -50,10 +52,21 @@ GRAPHQL_URL = "https://api.github.com/graphql"
 CHECKPOINT_VERSION = 1
 DEFAULT_BATCH_SIZE = 500
 MAX_BATCH_SIZE = 500
+DEFAULT_WORKERS = 4
+MAX_WORKERS = 4
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_TIMEOUT = 30.0
 RETRYABLE_STATUSES = ERROR_STATUSES | {"pending", "not_found"}
 SUCCESS_STATUSES = {"detected", "not_detected"}
+
+
+class RateState:
+    """Small shared rate-limit state for the bounded worker pool."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.not_before = 0.0
+        self.remaining: int | None = None
 
 
 def _api_error_text(error: object) -> str:
@@ -84,6 +97,26 @@ def _looks_like_rate_limit(messages: Iterable[str]) -> bool:
     return any(marker in message.casefold() for message in messages for marker in markers)
 
 
+def _looks_like_not_found(messages: Iterable[str]) -> bool:
+    markers = (
+        "could not resolve to a repository",
+        "repository was not found",
+        "not found",
+        "does not exist",
+    )
+    return any(marker in message.casefold() for message in messages for marker in markers)
+
+
+def _looks_like_temporary_graphql_error(messages: Iterable[str]) -> bool:
+    markers = (
+        "resource limits",
+        "something went wrong",
+        "timeout",
+        "temporarily",
+    )
+    return any(marker in message.casefold() for message in messages for marker in markers)
+
+
 class GitHubGraphQLClient:
     """Sequential GraphQL client with retries and primary/secondary limits."""
 
@@ -92,6 +125,7 @@ class GitHubGraphQLClient:
         token: str | None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         timeout: float = DEFAULT_TIMEOUT,
+        rate_state: RateState | None = None,
     ) -> None:
         self.max_retries = max(0, max_retries)
         self.timeout = timeout
@@ -106,8 +140,12 @@ class GitHubGraphQLClient:
         )
         if token:
             self.session.headers["Authorization"] = f"Bearer {token}"
-        self.not_before = 0.0
-        self.remaining: int | None = None
+        self.rate_state = rate_state or RateState()
+
+    @property
+    def remaining(self) -> int | None:
+        with self.rate_state.lock:
+            return self.rate_state.remaining
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> float | None:
@@ -131,12 +169,16 @@ class GitHubGraphQLClient:
             remaining = int(value) if value is not None else None
         except ValueError:
             remaining = None
-        self.remaining = remaining
-        if remaining == 0 and reset_value:
-            try:
-                self.not_before = max(self.not_before, float(reset_value) + 1.0)
-            except ValueError:
-                pass
+        with self.rate_state.lock:
+            self.rate_state.remaining = remaining
+            if remaining == 0 and reset_value:
+                try:
+                    self.rate_state.not_before = max(
+                        self.rate_state.not_before,
+                        float(reset_value) + 1.0,
+                    )
+                except ValueError:
+                    pass
         return remaining
 
     def _update_rate_state_from_payload(self, payload: object) -> None:
@@ -150,12 +192,17 @@ class GitHubGraphQLClient:
             return
         remaining = rate.get("remaining")
         if isinstance(remaining, int):
-            self.remaining = remaining
+            with self.rate_state.lock:
+                self.rate_state.remaining = remaining
         reset_at = rate.get("resetAt")
         if self.remaining == 0 and isinstance(reset_at, str):
             try:
                 parsed = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
-                self.not_before = max(self.not_before, parsed.timestamp() + 1.0)
+                with self.rate_state.lock:
+                    self.rate_state.not_before = max(
+                        self.rate_state.not_before,
+                        parsed.timestamp() + 1.0,
+                    )
             except ValueError:
                 pass
 
@@ -170,7 +217,9 @@ class GitHubGraphQLClient:
             remaining -= pause
 
     def _wait_for_rate_limit(self) -> None:
-        wait_seconds = self.not_before - time.time()
+        with self.rate_state.lock:
+            not_before = self.rate_state.not_before
+        wait_seconds = not_before - time.time()
         if wait_seconds > 0:
             self._sleep(wait_seconds, "X-RateLimit-Remaining=0")
 
@@ -311,9 +360,19 @@ class GitHubGraphQLClient:
                     value = data.get(alias, missing)
                     if value is None:
                         message = "; ".join(alias_errors)
+                        if _looks_like_rate_limit(alias_errors):
+                            alias_status = "rate_limit_error"
+                        elif alias_errors and not _looks_like_not_found(alias_errors):
+                            alias_status = (
+                                "temporary_error"
+                                if _looks_like_temporary_graphql_error(alias_errors)
+                                else "unexpected_response"
+                            )
+                        else:
+                            alias_status = "not_found"
                         results[reference.key] = CheckResult(
                             0,
-                            "not_found",
+                            alias_status,
                             [],
                             message or "GitHub no resolvió el repositorio",
                             status_code,
@@ -773,13 +832,36 @@ def _unique_references(references: Sequence[RepositoryRef | None]) -> dict[str, 
     return unique
 
 
-def _process_pass(
+def _safe_inspect(
     client: GitHubGraphQLClient,
+    batch: Sequence[RepositoryRef],
+) -> dict[str, CheckResult]:
+    try:
+        return client.inspect_batch(batch)
+    except Exception as exc:  # pragma: no cover - defensive worker boundary
+        LOGGER.exception(
+            "Error inesperado en un lote GraphQL; se registrará como error técnico."
+        )
+        return {
+            reference.key: CheckResult(
+                0,
+                "unexpected_response",
+                [],
+                f"error inesperado del lote: {exc}",
+                None,
+            )
+            for reference in batch
+        }
+
+
+def _process_pass(
+    clients: Sequence[GitHubGraphQLClient],
     checkpoint: SQLiteCheckpoint,
     table: str,
     references: Mapping[str, RepositoryRef],
     records: dict[str, dict[str, Any]],
     batch_size: int,
+    workers: int,
     retry_errors: bool,
     pass_name: str,
 ) -> int:
@@ -795,43 +877,71 @@ def _process_pass(
 
     total = len(pending)
     completed = 0
-    for start in range(0, total, batch_size):
-        batch = pending[start : start + batch_size]
-        batch_results = client.inspect_batch(batch)
-        serializable: dict[str, dict[str, Any]] = {}
-        for reference in batch:
-            result = batch_results.get(reference.key)
-            if result is None:
-                result = CheckResult(
-                    0,
-                    "unexpected_response",
-                    [],
-                    "la respuesta no incluyó el repositorio del lote",
-                    None,
+    worker_count = max(1, min(workers, len(clients), total))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        group_size = batch_size * worker_count
+        for group_start in range(0, total, group_size):
+            batches = [
+                pending[start : start + batch_size]
+                for start in range(
+                    group_start,
+                    min(group_start + group_size, total),
+                    batch_size,
                 )
-            serializable[reference.key] = {
-                **result.as_dict(),
-                "repository": reference.full_name,
-                "checked_at": utc_now(),
-            }
-        checkpoint.save_batch(table, serializable)
-        records.update(serializable)
-        completed += len(batch)
-        detected = sum(record["status"] == "detected" for record in serializable.values())
-        technical = sum(
-            record["status"] not in SUCCESS_STATUSES for record in serializable.values()
-        )
-        LOGGER.info(
-            "%s [%d-%d/%d] lote guardado; GH-AW=1: %d; no concluyentes: %d; "
-            "rate restante: %s",
-            pass_name,
-            completed - len(batch) + 1,
-            completed,
-            total,
-            detected,
-            technical,
-            client.remaining if client.remaining is not None else "desconocido",
-        )
+            ]
+            futures = [
+                executor.submit(
+                    _safe_inspect,
+                    clients[index % worker_count],
+                    batch,
+                )
+                for index, batch in enumerate(batches)
+            ]
+            group_detected = 0
+            group_technical = 0
+            for batch, future in zip(batches, futures):
+                batch_results = future.result()
+                serializable: dict[str, dict[str, Any]] = {}
+                for reference in batch:
+                    result = batch_results.get(reference.key)
+                    if result is None:
+                        result = CheckResult(
+                            0,
+                            "unexpected_response",
+                            [],
+                            "la respuesta no incluyó el repositorio del lote",
+                            None,
+                        )
+                    serializable[reference.key] = {
+                        **result.as_dict(),
+                        "repository": reference.full_name,
+                        "checked_at": utc_now(),
+                    }
+                checkpoint.save_batch(table, serializable)
+                records.update(serializable)
+                completed += len(batch)
+                group_detected += sum(
+                    record["status"] == "detected"
+                    for record in serializable.values()
+                )
+                group_technical += sum(
+                    record["status"] not in SUCCESS_STATUSES
+                    for record in serializable.values()
+                )
+            group_start_display = completed - sum(len(batch) for batch in batches) + 1
+            LOGGER.info(
+                "%s [%d-%d/%d] lotes guardados; GH-AW=1: %d; no concluyentes: %d; "
+                "rate restante: %s",
+                pass_name,
+                group_start_display,
+                completed,
+                total,
+                group_detected,
+                group_technical,
+                clients[0].remaining
+                if clients[0].remaining is not None
+                else "desconocido",
+            )
     return completed
 
 
@@ -932,11 +1042,17 @@ def run(args: argparse.Namespace) -> int:
         source,
         reset=args.reset_checkpoint,
     )
-    client = GitHubGraphQLClient(
-        resolve_github_token(),
-        max_retries=args.max_retries,
-        timeout=args.timeout,
-    )
+    token = resolve_github_token()
+    shared_rate_state = RateState()
+    clients = [
+        GitHubGraphQLClient(
+            token,
+            max_retries=args.max_retries,
+            timeout=args.timeout,
+            rate_state=shared_rate_state,
+        )
+        for _ in range(args.workers)
+    ]
     initial = checkpoint.load("results")
     revalidations = checkpoint.load("revalidations")
 
@@ -944,16 +1060,17 @@ def run(args: argparse.Namespace) -> int:
         passes = 2 if args.retry_errors else 1
         for pass_number in range(1, passes + 1):
             completed = _process_pass(
-                client,
+                clients,
                 checkpoint,
                 "results",
                 unique,
                 initial,
                 args.batch_size,
+                args.workers,
                 retry_errors=pass_number > 1,
                 pass_name=f"Detección (pasada {pass_number})",
             )
-            if pass_number > 1 or completed == 0:
+            if pass_number > 1 or (completed == 0 and not args.retry_errors):
                 break
 
         positive_refs = {
@@ -963,16 +1080,17 @@ def run(args: argparse.Namespace) -> int:
         }
         for pass_number in range(1, passes + 1):
             completed = _process_pass(
-                client,
+                clients,
                 checkpoint,
                 "revalidations",
                 positive_refs,
                 revalidations,
                 args.batch_size,
+                args.workers,
                 retry_errors=pass_number > 1,
                 pass_name=f"Revalidación de positivos (pasada {pass_number})",
             )
-            if pass_number > 1 or completed == 0:
+            if pass_number > 1 or (completed == 0 and not args.retry_errors):
                 break
 
         enriched = build_output(df, references, initial, revalidations)
@@ -1074,6 +1192,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Repositorios por query GraphQL (máximo {MAX_BATCH_SIZE}; por defecto: {DEFAULT_BATCH_SIZE}).",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Workers concurrentes acotados (máximo {MAX_WORKERS}; por defecto: {DEFAULT_WORKERS}).",
+    )
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=DEFAULT_MAX_RETRIES,
@@ -1109,6 +1233,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not 1 <= args.batch_size <= MAX_BATCH_SIZE:
         parser.error(f"--batch-size debe estar entre 1 y {MAX_BATCH_SIZE}")
+    if not 1 <= args.workers <= MAX_WORKERS:
+        parser.error(f"--workers debe estar entre 1 y {MAX_WORKERS}")
     if args.max_retries < 0:
         parser.error("--max-retries no puede ser negativo")
     if args.timeout <= 0:

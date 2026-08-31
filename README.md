@@ -75,7 +75,8 @@ python src/process_gh_aw_graphql.py --input data/input.csv --retry-errors
 ```
 
 El procesamiento recomendado usa GraphQL por lotes de hasta 500 repositorios y
-lee exclusivamente el árbol `.github/workflows/`. También existe
+hasta 4 workers acotados, y lee exclusivamente el árbol `.github/workflows/`.
+También existe
 `src/detect_gh_aw.py`, una variante REST secuencial útil para ejecuciones
 pequeñas o para revisar un CSV alternativo.
 
