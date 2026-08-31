@@ -770,13 +770,17 @@ def _records_for_output(
             + ", ".join(collisions)
         )
 
-    gh_aw: list[int] = []
+    # A technical failure is intentionally represented as an empty value in
+    # ``gh_aw``.  This keeps 0 meaningful: it is reserved for a completed
+    # inspection that found no matching pair.  The detailed reason remains in
+    # ``gh_aw_status`` and ``gh_aw_error``.
+    gh_aw: list[object] = []
     statuses: list[str] = []
     matches: list[str] = []
     errors: list[str] = []
     for reference in references:
         if reference is None:
-            gh_aw.append(0)
+            gh_aw.append("")
             statuses.append("input_error")
             matches.append("")
             errors.append("no se pudo identificar owner/repository en esta fila")
@@ -784,14 +788,15 @@ def _records_for_output(
 
         record = repositories.get(reference.key)
         if record is None:
-            gh_aw.append(0)
+            gh_aw.append("")
             statuses.append("pending")
             matches.append("")
             errors.append("")
             continue
 
-        gh_aw.append(int(record.get("gh_aw", 0)))
-        statuses.append(str(record.get("status", "error")))
+        status = str(record.get("status", "error"))
+        gh_aw.append(int(record.get("gh_aw", 0)) if status in {"detected", "not_detected"} else "")
+        statuses.append(status)
         matches.append("|".join(str(item) for item in record.get("matches", [])))
         errors.append(str(record.get("error", "")))
 

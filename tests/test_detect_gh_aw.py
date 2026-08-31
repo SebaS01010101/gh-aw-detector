@@ -15,6 +15,7 @@ from detect_gh_aw import (  # noqa: E402
     parse_repository_reference,
     resolve_repository_source,
 )
+from process_gh_aw_graphql import GitHubGraphQLClient, build_output  # noqa: E402
 
 
 def test_exact_md_and_lock_pair_is_detected() -> None:
@@ -153,3 +154,63 @@ def test_client_retries_primary_rate_limit_before_classifying() -> None:
 
     assert result.gh_aw == 0
     assert result.status == "not_detected"
+
+
+def test_graphql_batch_detects_exact_pair_and_missing_directory() -> None:
+    payload = {
+        "data": {
+            "rateLimit": {"remaining": 10, "cost": 1},
+            "r0": {
+                "name": "repo-name",
+                "object": {
+                    "__typename": "Tree",
+                    "entries": [
+                        {"name": "agent.md", "type": "blob"},
+                        {"name": "agent.lock.yml", "type": "blob"},
+                        {"name": "other.lock.yml", "type": "blob"},
+                    ],
+                },
+            },
+            "r1": {"name": "without-workflows", "object": None},
+        }
+    }
+    client = GitHubGraphQLClient("test-token", max_retries=0)
+    client.session.post = lambda *_args, **_kwargs: FakeResponse(  # type: ignore[method-assign]
+        200, payload, {"X-RateLimit-Remaining": "10"}
+    )
+
+    results = client.inspect_batch(
+        [RepositoryRef("owner", "repo-name"), RepositoryRef("owner", "without-workflows")]
+    )
+
+    assert results["owner/repo-name"].status == "detected"
+    assert results["owner/repo-name"].matches == ["agent"]
+    assert results["owner/without-workflows"].status == "not_detected"
+
+
+def test_graphql_query_escapes_repository_names() -> None:
+    query, _ = GitHubGraphQLClient._query([RepositoryRef("an-owner", "repo-name")])
+
+    assert 'owner:"an-owner"' in query
+    assert 'name:"repo-name"' in query
+    assert 'expression:"HEAD:.github/workflows"' in query
+
+
+def test_output_does_not_turn_technical_error_into_zero() -> None:
+    frame = pd.DataFrame({"repository": ["owner/repo"]})
+    result = build_output(
+        frame,
+        [RepositoryRef("owner", "repo")],
+        {
+            "owner/repo": {
+                "gh_aw": 0,
+                "status": "network_error",
+                "matches": [],
+                "error": "timeout",
+            }
+        },
+        {},
+    )
+
+    assert result.loc[0, "gh_aw"] == ""
+    assert result.loc[0, "gh_aw_status"] == "network_error"
