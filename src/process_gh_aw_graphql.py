@@ -48,7 +48,8 @@ from detect_gh_aw import (
 LOGGER = logging.getLogger("process_gh_aw_graphql")
 GRAPHQL_URL = "https://api.github.com/graphql"
 CHECKPOINT_VERSION = 1
-DEFAULT_BATCH_SIZE = 100
+DEFAULT_BATCH_SIZE = 500
+MAX_BATCH_SIZE = 500
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_TIMEOUT = 30.0
 RETRYABLE_STATUSES = ERROR_STATUSES | {"pending", "not_found"}
@@ -1070,7 +1071,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help=f"Repositorios por query GraphQL (máximo 100; por defecto: {DEFAULT_BATCH_SIZE}).",
+        help=f"Repositorios por query GraphQL (máximo {MAX_BATCH_SIZE}; por defecto: {DEFAULT_BATCH_SIZE}).",
     )
     parser.add_argument(
         "--max-retries",
@@ -1106,8 +1107,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not 1 <= args.batch_size <= 100:
-        parser.error("--batch-size debe estar entre 1 y 100")
+    if not 1 <= args.batch_size <= MAX_BATCH_SIZE:
+        parser.error(f"--batch-size debe estar entre 1 y {MAX_BATCH_SIZE}")
     if args.max_retries < 0:
         parser.error("--max-retries no puede ser negativo")
     if args.timeout <= 0:
